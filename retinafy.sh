@@ -266,9 +266,9 @@ select_display() {
 
     log_ok "Selected: ${NAME} (${VID}:${PID})"
     log_warn "Double-check this is really the external monitor, not the built-in display, before continuing."
-    prompt "Continue? [y/N]: "
+    prompt "Continue? [Y/n] (default: Yes): "
     read -r confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
+    [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
 }
 
 # ---------------------------------------------------------------------------
@@ -711,8 +711,11 @@ enable_flow() {
             compute_auto_ladder "$native_w" "$native_h"
             prefill="${RESOLUTIONS[*]}"
         fi
-        prompt "Edit the \"looks like\" resolutions, space-separated:\n"
-        read -r -e -i "$prefill" manual_list
+        local list_prompt="Edit the \"looks like\" resolutions, space-separated"
+        [[ -n "$prefill" ]] && list_prompt="${list_prompt} [${prefill}]"
+        prompt "${list_prompt}: "
+        read -r manual_list
+        [[ -z "$manual_list" ]] && manual_list="$prefill"
         RESOLUTIONS=($manual_list)
         RESOLUTION_LABELS=()
         [[ ${#RESOLUTIONS[@]} -gt 0 ]] || die "No resolutions entered."
@@ -734,7 +737,7 @@ enable_flow() {
     PATCHED_EDID=""
     if [[ -n "$EDID" ]]; then
         printf "\n"
-        prompt "Apply the EDID sleep/wake compatibility patch? Only needed if the display drops to a lower resolution after sleep. [y/N]: "
+        prompt "Apply the EDID sleep/wake compatibility patch? Only needed if the display drops to a lower resolution after sleep. [y/N] (default: No): "
         read -r patch_choice
         if [[ "$patch_choice" =~ ^[Yy]$ ]]; then
             patch_edid
