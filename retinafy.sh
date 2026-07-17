@@ -1,0 +1,825 @@
+#!/bin/bash
+#
+# retinafy — enable simulated HiDPI ("Retina") scaling on external displays
+# that don't natively report a HiDPI mode to macOS.
+#
+# Requires macOS 26 (Tahoe) or later. No backward compatibility is provided
+# for earlier releases.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ICONS_DIR="${SCRIPT_DIR}/icons"
+
+OVERRIDES_DIR="/Library/Displays/Contents/Resources/Overrides"
+SYS_OVERRIDES_DIR="/System/Library/Displays/Contents/Resources/Overrides"
+SYS_ICONS_PLIST="${SYS_OVERRIDES_DIR}/Icons.plist"
+FALLBACK_ICONS_PLIST="${SCRIPT_DIR}/Icons.plist"
+UNINSTALL_SCRIPT="${HOME}/.retinafy-disable"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+
+# Fill in after you publish your own fork, e.g.
+# "https://raw.githubusercontent.com/<you>/retinafy/main"
+DOWNLOAD_HOST=""
+
+WORKDIR=""
+SUDO_KEEPALIVE_PID=""
+
+# ---------------------------------------------------------------------------
+# Presentation
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_RED=$'\033[31m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+fi
+
+print_banner() {
+    printf "%s\n" "${C_CYAN}${C_BOLD}"
+    printf "%s\n" "┌─────────────────────────────────────────┐"
+    printf "%s\n" "│  retinafy · HiDPI for external displays  │"
+    printf "%s\n" "└─────────────────────────────────────────┘${C_RESET}"
+    printf "\n"
+}
+
+log_info() { printf "%s\n" "${C_DIM}  $*${C_RESET}"; }
+log_ok()   { printf "%s\n" "${C_GREEN}  ✓ $*${C_RESET}"; }
+log_warn() { printf "%s\n" "${C_YELLOW}  ! $*${C_RESET}"; }
+log_err()  { printf "%s\n" "${C_RED}  ✗ $*${C_RESET}" >&2; }
+section()  { printf "\n%s\n\n" "${C_BOLD}$*${C_RESET}"; }
+prompt()   { printf "%s" "${C_YELLOW}› $*${C_RESET}"; }
+
+die() {
+    log_err "$*"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Environment checks
+# ---------------------------------------------------------------------------
+
+require_macos26() {
+    local product major
+    product="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+    major="${product%%.*}"
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || (( major < 26 )); then
+        die "retinafy requires macOS 26 (Tahoe) or later. Detected: ${product:-unknown}."
+    fi
+}
+
+is_apple_silicon() {
+    [[ "$(uname -m)" == "arm64" ]]
+}
+
+start_sudo_keepalive() {
+    sudo -v || die "Administrator privileges are required to continue."
+    ( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+cleanup() {
+    [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Display discovery
+#
+# Two independent detection paths feed the same candidate list:
+#   - Intel: real EDID, read from ioreg.
+#   - Apple Silicon: no real EDID: VendorID/ProductID recovered from the
+#     IOKit "DisplayAttributes" block instead.
+#
+# Apple's own manufacturer id (0x0610) is always excluded. That covers both
+# the built-in panel and Apple's own external displays (Studio Display, Pro
+# Display XDR...), which already have proper native HiDPI and must never be
+# touched by this tool.
+# ---------------------------------------------------------------------------
+
+DISP_VID=()
+DISP_PID=()
+DISP_NAME=()
+DISP_EDID=()
+
+APPLE_VENDOR_ID="610"
+
+# Vendor/product ids are kept in the same non-zero-padded lowercase hex form
+# Apple's own Overrides tree uses for folder names and Icons.plist keys
+# (e.g. "610", "1e6d" — never "0610"), not the fixed-width form ioreg/EDID
+# parsing naturally produces.
+hex_norm() {
+    printf '%x' "$((16#$1))"
+}
+
+discover_displays_intel() {
+    local raw
+    raw=($(ioreg -lw0 | grep -i "IODisplayEDID" | sed -e "/[^<]*</s///" -e "s/\>//"))
+
+    local entry vid pid name
+    for entry in "${raw[@]}"; do
+        vid=$(hex_norm "${entry:16:4}")
+        [[ "$vid" == "$APPLE_VENDOR_ID" ]] && continue
+
+        pid=$(hex_norm "${entry:22:2}${entry:20:2}")
+        name="$(echo "${entry:190:24}" | xxd -p -r 2>/dev/null | tr -d '\000')"
+        [[ -z "$name" ]] && name="Unknown Display"
+
+        DISP_VID+=("$vid")
+        DISP_PID+=("$pid")
+        DISP_NAME+=("$name")
+        DISP_EDID+=("$entry")
+    done
+}
+
+discover_displays_apple_silicon() {
+    local vends prods names
+    vends=($(ioreg -l | grep "DisplayAttributes" | sed -n 's/.*"LegacyManufacturerID"=\([0-9]*\).*/\1/p'))
+    prods=($(ioreg -l | grep "DisplayAttributes" | sed -n 's/.*"ProductID"=\([0-9]*\).*/\1/p'))
+    # IFS/noglob must be restored explicitly: an assignment-only command like
+    # `IFS=x names=(...)` does NOT scope IFS temporarily the way it would
+    # before a real command — it leaks into the rest of the script.
+    local old_ifs="$IFS"
+    IFS=$'\n'
+    set -o noglob
+    names=($(ioreg -l | grep "DisplayAttributes" | sed -n 's/.*"ProductName"="\([^"]*\)".*/\1/p'))
+    set +o noglob
+    IFS="$old_ifs"
+
+    # vends[]/prods[] are decimal (from ioreg's LegacyManufacturerID/ProductID),
+    # unlike the hex substrings discover_displays_intel deals with — hex_norm
+    # would misinterpret them, so convert straight to hex here instead.
+    local i vid pid name_index=0
+    for ((i = 0; i < ${#prods[@]}; i++)); do
+        vid=$(printf "%x" "${vends[$i]}")
+        [[ "$vid" == "$APPLE_VENDOR_ID" ]] && continue
+
+        pid=$(printf "%x" "${prods[$i]}")
+        name="${names[$name_index]:-Unknown Display}"
+        name_index=$((name_index + 1))
+
+        DISP_VID+=("$vid")
+        DISP_PID+=("$pid")
+        DISP_NAME+=("$name")
+        DISP_EDID+=("")
+    done
+}
+
+# Best-effort corroboration only: if system_profiler reports this pair as
+# the internal panel, drop it. Absence of a signal is not treated as proof
+# of anything — the VendorID gate above is the real safety net.
+looks_internal_per_system_profiler() {
+    local vid_dec=$1 pid_dec=$2
+    [[ -z "$SP_PLIST" ]] && return 1
+
+    local i=0 j hit
+    while true; do
+        "$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:_name" "$SP_PLIST" >/dev/null 2>&1 || break
+        j=0
+        while true; do
+            hit="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}:_spdisplays_display-vendor-id" "$SP_PLIST" 2>/dev/null)"
+            [[ -z "$hit" ]] && break
+            local pid_hit
+            pid_hit="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}:_spdisplays_display-product-id" "$SP_PLIST" 2>/dev/null)"
+            if [[ "$((16#$hit))" == "$vid_dec" && "$((16#$pid_hit))" == "$pid_dec" ]]; then
+                local raw
+                raw="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}" "$SP_PLIST" 2>/dev/null)"
+                if grep -qi "internal\|built-in\|builtin" <<<"$raw"; then
+                    return 0
+                fi
+                return 1
+            fi
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+    return 1
+}
+
+SP_PLIST=""
+
+load_system_profiler_snapshot() {
+    WORKDIR="$(mktemp -d)"
+    SP_PLIST="${WORKDIR}/displays.plist"
+    if ! system_profiler SPDisplaysDataType -json 2>/dev/null | plutil -convert xml1 -o "$SP_PLIST" - 2>/dev/null; then
+        SP_PLIST=""
+    fi
+}
+
+discover_displays() {
+    load_system_profiler_snapshot
+
+    if is_apple_silicon; then
+        discover_displays_apple_silicon
+    else
+        discover_displays_intel
+    fi
+
+    local kept_vid=() kept_pid=() kept_name=() kept_edid=()
+    local i vid_dec pid_dec
+    for ((i = 0; i < ${#DISP_VID[@]}; i++)); do
+        vid_dec=$((16#${DISP_VID[$i]}))
+        pid_dec=$((16#${DISP_PID[$i]}))
+        if looks_internal_per_system_profiler "$vid_dec" "$pid_dec"; then
+            continue
+        fi
+        kept_vid+=("${DISP_VID[$i]}")
+        kept_pid+=("${DISP_PID[$i]}")
+        kept_name+=("${DISP_NAME[$i]}")
+        kept_edid+=("${DISP_EDID[$i]}")
+    done
+    DISP_VID=("${kept_vid[@]}")
+    DISP_PID=("${kept_pid[@]}")
+    DISP_NAME=("${kept_name[@]}")
+    DISP_EDID=("${kept_edid[@]}")
+}
+
+select_display() {
+    if [[ ${#DISP_VID[@]} -eq 0 ]]; then
+        die "No external display found. The built-in display is never listed here — connect an external monitor and try again."
+    fi
+
+    section "Detected external displays (built-in excluded)"
+    local i
+    for ((i = 0; i < ${#DISP_VID[@]}; i++)); do
+        printf "  %d) %-24s (%s:%s)\n" $((i + 1)) "${DISP_NAME[$i]}" "${DISP_VID[$i]}" "${DISP_PID[$i]}"
+    done
+    printf "\n"
+    prompt "Select a display [1-${#DISP_VID[@]}]: "
+    read -r choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#DISP_VID[@]} )); then
+        die "Invalid selection."
+    fi
+
+    SEL_INDEX=$((choice - 1))
+    VID="${DISP_VID[$SEL_INDEX]}"
+    PID="${DISP_PID[$SEL_INDEX]}"
+    NAME="${DISP_NAME[$SEL_INDEX]}"
+    EDID="${DISP_EDID[$SEL_INDEX]}"
+
+    log_ok "Selected: ${NAME} (${VID}:${PID})"
+    log_warn "Double-check this is really the external monitor, not the built-in display, before continuing."
+    prompt "Continue? [y/N]: "
+    read -r confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
+}
+
+# ---------------------------------------------------------------------------
+# Native resolution lookup (used by Auto mode)
+# ---------------------------------------------------------------------------
+
+get_native_resolution() {
+    local vid_hex=$1 pid_hex=$2
+    [[ -z "$SP_PLIST" ]] && return 1
+
+    local vid_dec=$((16#$vid_hex))
+    local pid_dec=$((16#$pid_hex))
+    local i=0 j hit pid_hit pixels
+
+    while true; do
+        "$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:_name" "$SP_PLIST" >/dev/null 2>&1 || break
+        j=0
+        while true; do
+            hit="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}:_spdisplays_display-vendor-id" "$SP_PLIST" 2>/dev/null)"
+            [[ -z "$hit" ]] && break
+            pid_hit="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}:_spdisplays_display-product-id" "$SP_PLIST" 2>/dev/null)"
+            if [[ "$((16#$hit))" == "$vid_dec" && "$((16#$pid_hit))" == "$pid_dec" ]]; then
+                pixels="$("$PLISTBUDDY" -c "Print :SPDisplaysDataType:${i}:spdisplays_ndrvs:${j}:_spdisplays_pixels" "$SP_PLIST" 2>/dev/null)"
+                [[ -z "$pixels" ]] && return 1
+                echo "$pixels" | tr -d ' '
+                return 0
+            fi
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Resolution ladder (Auto mode)
+#
+# macOS shows 5 "looks like" options on a real Retina display: three
+# "Larger Text" steps, "Default" (native / 2 exactly), and one "More Space"
+# step. These ratios (relative to Default) are taken directly from a real,
+# verified macOS list — MacBook Pro 14" (native 3024x1964) shows exactly
+# 1024x665, 1147x745, 1352x878, 1512x982 (Default), 1800x1169 — rather than
+# an invented progression, so applying them to any other native resolution
+# reproduces the same step spacing Apple actually uses, aspect-ratio-locked.
+# ---------------------------------------------------------------------------
+
+LADDER_RATIOS=(0.677248677 0.758597884 0.894179894 1.0 1.190476190)
+LADDER_LABELS=("Larger Text" "Larger Text" "Larger Text" "Default" "More Space")
+
+RESOLUTIONS=()
+RESOLUTION_LABELS=()
+DEFAULT_RESOLUTION=""
+
+compute_auto_ladder() {
+    local native_w=$1 native_h=$2
+    RESOLUTIONS=()
+    RESOLUTION_LABELS=()
+    DEFAULT_RESOLUTION=""
+    local i f w h entry seen=""
+    for ((i = 0; i < ${#LADDER_RATIOS[@]}; i++)); do
+        f="${LADDER_RATIOS[$i]}"
+        w=$(awk -v n="$native_w" -v f="$f" 'BEGIN{printf "%d", int(n*f/2 + 0.5)}')
+        h=$(awk -v n="$native_h" -v f="$f" 'BEGIN{printf "%d", int(n*f/2 + 0.5)}')
+        entry="${w}x${h}"
+        [[ "$seen" == *"|${entry}|"* ]] && continue
+        seen="${seen}|${entry}|"
+        RESOLUTIONS+=("$entry")
+        RESOLUTION_LABELS+=("${LADDER_LABELS[$i]}")
+        [[ "${LADDER_LABELS[$i]}" == "Default" ]] && DEFAULT_RESOLUTION="$entry"
+    done
+}
+
+aspect_ratio_warning() {
+    local native_w=$1 native_h=$2 w=$3 h=$4
+    awk -v nw="$native_w" -v nh="$native_h" -v w="$w" -v h="$h" '
+        BEGIN {
+            na = nw / nh; wa = w / h;
+            diff = na - wa; if (diff < 0) diff = -diff;
+            if (diff / na > 0.002) exit 0; else exit 1;
+        }'
+}
+
+# ---------------------------------------------------------------------------
+# Override file generation
+# ---------------------------------------------------------------------------
+
+# Each entry is 9 bytes: 4-byte width, 4-byte height, 1 trailing flag byte
+# (left at 0x00 here). Older HiDPI-injection scripts also emitted extra
+# entries bundling additional non-zero flag bytes for "safe/TV/interlaced"
+# variants; macOS 26's Displays UI no longer labels those compound entries
+# as HiDPI, so only this plain single-entry form is used here.
+emit_resolution() {
+    local res=$1
+    local width height hidpi
+    width=$(cut -d x -f 1 <<<"$res")
+    height=$(cut -d x -f 2 <<<"$res")
+    hidpi=$(printf '%08x %08x' $((width * 2)) $((height * 2)) | xxd -r -p | base64)
+    printf '                <data>%sA</data>\n' "${hidpi:0:11}" >>"$DPI_FILE"
+}
+
+build_override_file() {
+    DPI_FILE="${WORKDIR}/DisplayVendorID-${VID}/DisplayProductID-${PID}"
+    mkdir -p "$(dirname "$DPI_FILE")"
+
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        printf '<plist version="1.0">\n'
+        printf '    <dict>\n'
+        printf '        <key>DisplayProductID</key>\n'
+        printf '            <integer>%d</integer>\n' "$((16#$PID))"
+        printf '        <key>DisplayVendorID</key>\n'
+        printf '            <integer>%d</integer>\n' "$((16#$VID))"
+    } >"$DPI_FILE"
+
+    if [[ -n "${PATCHED_EDID:-}" ]]; then
+        printf '        <key>IODisplayEDID</key>\n            <data>%s</data>\n' "$PATCHED_EDID" >>"$DPI_FILE"
+    fi
+
+    printf '        <key>scale-resolutions</key>\n            <array>\n' >>"$DPI_FILE"
+    local res
+    for res in "${RESOLUTIONS[@]}"; do
+        emit_resolution "$res"
+    done
+    {
+        printf '            </array>\n'
+        printf '        <key>target-default-ppmm</key>\n'
+        printf '            <real>10.0699301</real>\n'
+        printf '    </dict>\n'
+        printf '</plist>\n'
+    } >>"$DPI_FILE"
+}
+
+# Intel-only compatibility patch: some monitors fall back to a lower
+# resolution after sleep/wake unless the injected EDID also advertises a
+# preferred-timing/digital-input feature bitmap. This forges a copy of the
+# real EDID with those bits set; it never touches the monitor's own
+# firmware, only the copy macOS reads from the override file.
+patch_edid() {
+    local version basicparams checksum newchecksum newedid
+    version=${EDID:38:2}
+    basicparams=${EDID:40:2}
+    checksum=${EDID:254:2}
+    newchecksum=$(printf '%x' $((0x$checksum + 0x$version + 0x$basicparams - 0x04 - 0x90)) | tail -c 2)
+    newedid=${EDID:0:38}0490${EDID:42:6}e6${EDID:50:204}${newchecksum}
+    PATCHED_EDID=$(printf '%s' "$newedid" | xxd -r -p | base64)
+}
+
+# ---------------------------------------------------------------------------
+# Icon selection + Icons.plist merge
+#
+# The small "device shape" icon shown for a display comes from a local
+# .icns file we install. The larger resolution-preview illustration is
+# borrowed by reference from Apple's own bundled artwork, which already
+# ships under /System/Library/Displays for iMac/MacBook/MacBook Pro/Pro
+# Display XDR and is not something this tool needs to provide.
+# ---------------------------------------------------------------------------
+
+choose_icon() {
+    section "Display icon"
+    echo "  1) iMac"
+    echo "  2) MacBook"
+    echo "  3) MacBook Pro"
+    echo "  4) LG Display"
+    echo "  5) Pro Display XDR"
+    echo "  6) Don't change"
+    printf "\n"
+    prompt "Choice [1-6]: "
+    read -r icon_choice
+
+    local preview_icon="" preview_x="" preview_y="" preview_w="" preview_h=""
+    local device_icon_src=""
+
+    # Coordinates and Models/ filenames below were read directly from this
+    # machine's live /System/Library/Displays/.../Overrides/Icons.plist.
+    # macOS moved these preview images out of the old flat
+    # DisplayVendorID-610/DisplayProductID-<id>.tiff layout and into a
+    # shared Models/ folder with descriptive names — the old hidpi-injector
+    # scripts' hardcoded paths from that legacy layout no longer resolve.
+    case "$icon_choice" in
+    1)
+        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.imac-unibody-21.tiff"
+        preview_x=10; preview_y=85; preview_w=180; preview_h=102
+        device_icon_src="${ICONS_DIR}/iMac.icns"
+        ;;
+    2)
+        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.macbook-retina-space-gray.tiff"
+        preview_x=30; preview_y=45; preview_w=139; preview_h=87
+        device_icon_src="${ICONS_DIR}/MacBook.icns"
+        ;;
+    3)
+        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.macbookpro-13-retina-touchid-space-gray.tiff"
+        preview_x=31; preview_y=41; preview_w=148; preview_h=93
+        device_icon_src="${ICONS_DIR}/MacBookPro.icns"
+        ;;
+    4)
+        preview_icon="${SYS_OVERRIDES_DIR}/DisplayVendorID-1e6d/DisplayProductID-5b11.tiff"
+        preview_x=6; preview_y=61; preview_w=228; preview_h=129
+        device_icon_src="${SYS_OVERRIDES_DIR}/DisplayVendorID-1e6d/DisplayProductID-5b11.icns"
+        ;;
+    5)
+        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.pro-display-xdr-landscape.tiff"
+        preview_x=3; preview_y=59; preview_w=244; preview_h=137
+        device_icon_src="${ICONS_DIR}/ProDisplayXDR.icns"
+        ;;
+    6)
+        SKIP_ICON=1
+        return
+        ;;
+    *)
+        die "Invalid selection."
+        ;;
+    esac
+
+    ICON_PREVIEW="$preview_icon"
+    ICON_PREVIEW_X="$preview_x"
+    ICON_PREVIEW_Y="$preview_y"
+    ICON_PREVIEW_W="$preview_w"
+    ICON_PREVIEW_H="$preview_h"
+    DEVICE_ICON_SRC="$device_icon_src"
+}
+
+merge_icons_plist() {
+    [[ -n "${SKIP_ICON:-}" ]] && return
+
+    local target="${WORKDIR}/Icons.plist"
+    if [[ -f "${OVERRIDES_DIR}/Icons.plist" ]]; then
+        cp "${OVERRIDES_DIR}/Icons.plist" "$target"
+    elif [[ -f "$SYS_ICONS_PLIST" ]]; then
+        cp "$SYS_ICONS_PLIST" "$target"
+    elif [[ -f "$FALLBACK_ICONS_PLIST" ]]; then
+        cp "$FALLBACK_ICONS_PLIST" "$target"
+    else
+        log_warn "No base Icons.plist found; skipping icon customization."
+        SKIP_ICON=1
+        return
+    fi
+
+    # Icons.plist keys are the plain lowercase hex id (e.g. "1e6d", "5b11"),
+    # matching Apple's own entries — not the decimal form used for the
+    # DisplayVendorID/DisplayProductID integer fields elsewhere.
+    "$PLISTBUDDY" -c "Delete :vendors:${VID}:products:${PID}" "$target" >/dev/null 2>&1
+    "$PLISTBUDDY" -c "Add :vendors:${VID} dict" "$target" >/dev/null 2>&1
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products dict" "$target" >/dev/null 2>&1
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID} dict" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:display-resolution-preview-icon string ${ICON_PREVIEW}" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-x integer ${ICON_PREVIEW_X}" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-y integer ${ICON_PREVIEW_Y}" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-width integer ${ICON_PREVIEW_W}" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-height integer ${ICON_PREVIEW_H}" "$target"
+    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:display-icon string ${OVERRIDES_DIR}/DisplayVendorID-${VID}/DisplayProductID-${PID}.icns" "$target"
+
+    if ! plutil -lint -s "$target" >/dev/null 2>&1; then
+        die "Generated Icons.plist failed validation; aborting before touching the system copy."
+    fi
+    MERGED_ICONS_PLIST="$target"
+}
+
+# ---------------------------------------------------------------------------
+# Install / uninstall
+# ---------------------------------------------------------------------------
+
+install_override() {
+    sudo mkdir -p "${OVERRIDES_DIR}/DisplayVendorID-${VID}"
+
+    if [[ -n "${DEVICE_ICON_SRC:-}" ]]; then
+        cp "$DEVICE_ICON_SRC" "${WORKDIR}/DisplayVendorID-${VID}/DisplayProductID-${PID}.icns"
+    fi
+
+    sudo cp -r "${WORKDIR}/DisplayVendorID-${VID}" "${OVERRIDES_DIR}/"
+    sudo chown -R root:wheel "${OVERRIDES_DIR}/DisplayVendorID-${VID}"
+    sudo chmod -R 0644 "${OVERRIDES_DIR}/DisplayVendorID-${VID}"/*
+    sudo chmod 0755 "${OVERRIDES_DIR}/DisplayVendorID-${VID}"
+
+    if [[ -n "${MERGED_ICONS_PLIST:-}" ]]; then
+        sudo cp "$MERGED_ICONS_PLIST" "${OVERRIDES_DIR}/Icons.plist"
+        sudo chown root:wheel "${OVERRIDES_DIR}/Icons.plist"
+        sudo chmod 0644 "${OVERRIDES_DIR}/Icons.plist"
+    fi
+
+    sudo defaults write /Library/Preferences/com.apple.windowserver DisplayResolutionEnabled -bool YES
+
+    log_ok "HiDPI enabled for ${NAME}. Reboot to apply."
+    log_info "The boot logo will look oversized on the very first reboot only."
+}
+
+remove_override() {
+    local vid_hex=$1
+    if [[ -f "${OVERRIDES_DIR}/Icons.plist" ]]; then
+        sudo "$PLISTBUDDY" -c "Delete :vendors:${vid_hex}" "${OVERRIDES_DIR}/Icons.plist" >/dev/null 2>&1
+    fi
+    sudo rm -rf "${OVERRIDES_DIR}/DisplayVendorID-${vid_hex}"
+}
+
+# Safety net: writing the override only takes effect after reboot, so it
+# can't be tested live. Rather than leaving an unconfirmed change sitting
+# there if the user got interrupted mid-run, silence for 10s is treated as
+# "didn't mean to keep this" and the just-written override is undone before
+# the script even exits — not a promise to catch problems that only show up
+# after the next reboot (that's what Disable HiDPI / the recovery helper
+# are for).
+confirm_or_revert() {
+    if [[ ! -t 0 ]]; then
+        log_warn "Non-interactive session: skipping the confirm-or-revert safety window."
+        return 0
+    fi
+
+    printf "\n"
+    log_warn "If this display goes blank or wrong after rebooting, use \"Disable HiDPI\" or the recovery helper (~/.retinafy-disable)."
+    local secs=10
+    while (( secs > 0 )); do
+        printf "\r%s" "${C_YELLOW}› Press Enter to keep this change (auto-revert in ${secs}s)... ${C_RESET}"
+        if read -r -t 1 _; then
+            printf "\n"
+            log_ok "Change kept."
+            return 0
+        fi
+        secs=$((secs - 1))
+    done
+    printf "\n"
+    log_warn "No response — reverting automatically."
+    remove_override "$VID"
+    log_ok "Reverted. Nothing will change on next boot."
+    return 1
+}
+
+write_uninstall_helper() {
+    cat >"$UNINSTALL_SCRIPT" <<'EOS'
+#!/bin/bash
+# Emergency recovery helper for retinafy.
+# Usable from macOS Recovery Mode's Terminal if the system won't boot
+# normally after enabling HiDPI: mount the system volume, cd into this
+# user's home directory from /Volumes/<disk>/Users/<you>, then run this
+# script.
+set -u
+ROOT="../.."
+OVERRIDES="${ROOT}/Library/Displays/Contents/Resources/Overrides"
+
+if [[ ! -d "$OVERRIDES" ]]; then
+    echo "No retinafy overrides found at ${OVERRIDES}."
+    exit 0
+fi
+
+echo "Installed display overrides:"
+i=0
+declare -a dirs
+for d in "${OVERRIDES}"/DisplayVendorID-*; do
+    [[ -d "$d" ]] || continue
+    i=$((i + 1))
+    dirs[$i]="$d"
+    echo "  ${i}) $(basename "$d")"
+done
+
+if [[ $i -eq 0 ]]; then
+    echo "Nothing to remove."
+    exit 0
+fi
+
+echo ""
+echo "(1-${i}) Remove one specific override"
+echo "(a) Remove ALL overrides (reset to macOS default)"
+read -p "Choice: " choice
+
+if [[ "$choice" == "a" ]]; then
+    rm -rf "$OVERRIDES"
+    echo "All overrides removed."
+    exit 0
+fi
+
+if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le $i ]]; then
+    target="${dirs[$choice]}"
+    vid="${target##*DisplayVendorID-}"
+    if [[ -f "${OVERRIDES}/Icons.plist" ]]; then
+        "${ROOT}/usr/libexec/PlistBuddy" -c "Delete :vendors:${vid}" "${OVERRIDES}/Icons.plist" 2>/dev/null
+    fi
+    rm -rf "$target"
+    echo "Removed $(basename "$target")."
+else
+    echo "Invalid choice."
+    exit 1
+fi
+EOS
+    chmod +x "$UNINSTALL_SCRIPT"
+}
+
+disable_flow() {
+    if [[ ! -d "$OVERRIDES_DIR" ]]; then
+        die "No retinafy overrides are installed."
+    fi
+
+    section "Installed display overrides"
+    local dirs=() i=0
+    for d in "${OVERRIDES_DIR}"/DisplayVendorID-*; do
+        [[ -d "$d" ]] || continue
+        i=$((i + 1))
+        dirs[$i]="$d"
+        printf "  %d) %s\n" "$i" "$(basename "$d")"
+    done
+
+    if [[ $i -eq 0 ]]; then
+        die "No retinafy overrides are installed."
+    fi
+
+    printf "\n"
+    echo "  (a) Remove ALL overrides (reset to macOS default)"
+    printf "\n"
+    prompt "Choice [1-${i}, a]: "
+    read -r choice
+
+    start_sudo_keepalive
+
+    if [[ "$choice" == "a" ]]; then
+        sudo rm -rf "$OVERRIDES_DIR"
+        log_ok "All overrides removed. Reboot to apply."
+        return
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= i )); then
+        local target="${dirs[$choice]}"
+        local vid_hex="${target##*DisplayVendorID-}"
+        remove_override "$vid_hex"
+        log_ok "Removed $(basename "$target"). Reboot to apply."
+    else
+        die "Invalid choice."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Enable flow
+# ---------------------------------------------------------------------------
+
+enable_flow() {
+    discover_displays
+    select_display
+
+    local native=""
+    native="$(get_native_resolution "$VID" "$PID")"
+
+    section "Resolution setup for \"${NAME}\" (${VID}:${PID})"
+    if [[ -n "$native" ]]; then
+        log_info "Detected native resolution: ${native}"
+    else
+        log_warn "Could not auto-detect the native resolution via system_profiler."
+    fi
+    echo "  1) Auto   — generate the same variant ladder macOS uses for real Retina displays"
+    echo "  2) Manual — type your own list of \"looks like\" resolutions"
+    printf "\n"
+    prompt "Choice [1-2]: "
+    read -r res_choice
+
+    local native_w="" native_h=""
+    if [[ -n "$native" ]]; then
+        native_w="${native%x*}"
+        native_h="${native#*x}"
+    fi
+
+    case "$res_choice" in
+    1)
+        if [[ -z "$native_w" ]]; then
+            prompt "Enter the display's native resolution, e.g. 1920x1080: "
+            read -r manual_native
+            native_w="${manual_native%x*}"
+            native_h="${manual_native#*x}"
+        fi
+        [[ "$native_w" =~ ^[0-9]+$ && "$native_h" =~ ^[0-9]+$ ]] || die "Invalid resolution."
+        compute_auto_ladder "$native_w" "$native_h"
+        local i
+        for ((i = 0; i < ${#RESOLUTIONS[@]}; i++)); do
+            log_info "$(printf '%-12s %s' "${RESOLUTION_LABELS[$i]}" "${RESOLUTIONS[$i]}")"
+        done
+        log_ok "${#RESOLUTIONS[@]} HiDPI variants generated from ${native_w}x${native_h}. Default (${DEFAULT_RESOLUTION}) will be applied."
+        ;;
+    2)
+        local prefill=""
+        if [[ -n "$native_w" ]]; then
+            compute_auto_ladder "$native_w" "$native_h"
+            prefill="${RESOLUTIONS[*]}"
+        fi
+        prompt "Edit the \"looks like\" resolutions, space-separated:\n"
+        read -r -e -i "$prefill" manual_list
+        RESOLUTIONS=($manual_list)
+        RESOLUTION_LABELS=()
+        [[ ${#RESOLUTIONS[@]} -gt 0 ]] || die "No resolutions entered."
+        if [[ -n "$native_w" ]]; then
+            local r w h
+            for r in "${RESOLUTIONS[@]}"; do
+                w="${r%x*}"; h="${r#*x}"
+                if aspect_ratio_warning "$native_w" "$native_h" "$w" "$h"; then
+                    log_warn "${r} does not match the display's native aspect ratio — it may look blurry."
+                fi
+            done
+        fi
+        ;;
+    *)
+        die "Invalid selection."
+        ;;
+    esac
+
+    PATCHED_EDID=""
+    if [[ -n "$EDID" ]]; then
+        printf "\n"
+        prompt "Apply the EDID sleep/wake compatibility patch? Only needed if the display drops to a lower resolution after sleep. [y/N]: "
+        read -r patch_choice
+        if [[ "$patch_choice" =~ ^[Yy]$ ]]; then
+            patch_edid
+        fi
+    fi
+
+    choose_icon
+
+    start_sudo_keepalive
+    build_override_file
+    merge_icons_plist
+    install_override
+
+    if confirm_or_revert; then
+        write_uninstall_helper
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+main() {
+    require_macos26
+    print_banner
+
+    echo "  1) Enable HiDPI"
+    echo "  2) Disable HiDPI"
+    echo "  3) Exit"
+    printf "\n"
+    prompt "Select an option [1-3]: "
+    read -r choice
+
+    case "$choice" in
+    1)
+        enable_flow
+        ;;
+    2)
+        disable_flow
+        ;;
+    3)
+        exit 0
+        ;;
+    *)
+        die "Invalid selection."
+        ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
