@@ -78,10 +78,14 @@ start_sudo_keepalive() {
     sudo -v || die "Administrator privileges are required to continue."
     ( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
     SUDO_KEEPALIVE_PID=$!
+    disown "$SUDO_KEEPALIVE_PID" 2>/dev/null
 }
 
 cleanup() {
-    [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    fi
     [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -416,11 +420,12 @@ patch_edid() {
 # ---------------------------------------------------------------------------
 # Icon selection + Icons.plist merge
 #
-# The small "device shape" icon shown for a display comes from a local
-# .icns file we install. The larger resolution-preview illustration is
-# borrowed by reference from Apple's own bundled artwork, which already
-# ships under /System/Library/Displays for iMac/MacBook/MacBook Pro/Pro
-# Display XDR and is not something this tool needs to provide.
+# Only the small "device shape" icon (a local .icns file) is patched here.
+# macOS 26 no longer renders the old image-based resolution-preview
+# illustration from Icons.plist's display-resolution-preview-icon /
+# resolution-preview-x/y/w/h keys — that UI element appears to be rendered
+# natively now, so patching those keys is a no-op left over from older
+# macOS versions and has been removed.
 # ---------------------------------------------------------------------------
 
 choose_icon() {
@@ -435,41 +440,14 @@ choose_icon() {
     prompt "Choice [1-6]: "
     read -r icon_choice
 
-    local preview_icon="" preview_x="" preview_y="" preview_w="" preview_h=""
     local device_icon_src=""
 
-    # Coordinates and Models/ filenames below were read directly from this
-    # machine's live /System/Library/Displays/.../Overrides/Icons.plist.
-    # macOS moved these preview images out of the old flat
-    # DisplayVendorID-610/DisplayProductID-<id>.tiff layout and into a
-    # shared Models/ folder with descriptive names — the old hidpi-injector
-    # scripts' hardcoded paths from that legacy layout no longer resolve.
     case "$icon_choice" in
-    1)
-        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.imac-unibody-21.tiff"
-        preview_x=10; preview_y=85; preview_w=180; preview_h=102
-        device_icon_src="${ICONS_DIR}/iMac.icns"
-        ;;
-    2)
-        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.macbook-retina-space-gray.tiff"
-        preview_x=30; preview_y=45; preview_w=139; preview_h=87
-        device_icon_src="${ICONS_DIR}/MacBook.icns"
-        ;;
-    3)
-        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.macbookpro-13-retina-touchid-space-gray.tiff"
-        preview_x=31; preview_y=41; preview_w=148; preview_h=93
-        device_icon_src="${ICONS_DIR}/MacBookPro.icns"
-        ;;
-    4)
-        preview_icon="${SYS_OVERRIDES_DIR}/DisplayVendorID-1e6d/DisplayProductID-5b11.tiff"
-        preview_x=6; preview_y=61; preview_w=228; preview_h=129
-        device_icon_src="${SYS_OVERRIDES_DIR}/DisplayVendorID-1e6d/DisplayProductID-5b11.icns"
-        ;;
-    5)
-        preview_icon="${SYS_OVERRIDES_DIR}/Models/com.apple.pro-display-xdr-landscape.tiff"
-        preview_x=3; preview_y=59; preview_w=244; preview_h=137
-        device_icon_src="${ICONS_DIR}/ProDisplayXDR.icns"
-        ;;
+    1) device_icon_src="${ICONS_DIR}/iMac.icns" ;;
+    2) device_icon_src="${ICONS_DIR}/MacBook.icns" ;;
+    3) device_icon_src="${ICONS_DIR}/MacBookPro.icns" ;;
+    4) device_icon_src="${SYS_OVERRIDES_DIR}/DisplayVendorID-1e6d/DisplayProductID-5b11.icns" ;;
+    5) device_icon_src="${ICONS_DIR}/ProDisplayXDR.icns" ;;
     6)
         SKIP_ICON=1
         return
@@ -479,11 +457,6 @@ choose_icon() {
         ;;
     esac
 
-    ICON_PREVIEW="$preview_icon"
-    ICON_PREVIEW_X="$preview_x"
-    ICON_PREVIEW_Y="$preview_y"
-    ICON_PREVIEW_W="$preview_w"
-    ICON_PREVIEW_H="$preview_h"
     DEVICE_ICON_SRC="$device_icon_src"
 }
 
@@ -510,11 +483,6 @@ merge_icons_plist() {
     "$PLISTBUDDY" -c "Add :vendors:${VID} dict" "$target" >/dev/null 2>&1
     "$PLISTBUDDY" -c "Add :vendors:${VID}:products dict" "$target" >/dev/null 2>&1
     "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID} dict" "$target"
-    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:display-resolution-preview-icon string ${ICON_PREVIEW}" "$target"
-    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-x integer ${ICON_PREVIEW_X}" "$target"
-    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-y integer ${ICON_PREVIEW_Y}" "$target"
-    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-width integer ${ICON_PREVIEW_W}" "$target"
-    "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:resolution-preview-height integer ${ICON_PREVIEW_H}" "$target"
     "$PLISTBUDDY" -c "Add :vendors:${VID}:products:${PID}:display-icon string ${OVERRIDES_DIR}/DisplayVendorID-${VID}/DisplayProductID-${PID}.icns" "$target"
 
     if ! plutil -lint -s "$target" >/dev/null 2>&1; then
