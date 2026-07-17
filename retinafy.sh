@@ -18,10 +18,6 @@ FALLBACK_ICONS_PLIST="${SCRIPT_DIR}/Icons.plist"
 UNINSTALL_SCRIPT="${HOME}/.retinafy-disable"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 
-# Fill in after you publish your own fork, e.g.
-# "https://raw.githubusercontent.com/<you>/retinafy/main"
-DOWNLOAD_HOST=""
-
 WORKDIR=""
 SUDO_KEEPALIVE_PID=""
 

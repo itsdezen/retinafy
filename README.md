@@ -12,7 +12,7 @@ Requires **macOS 26 (Tahoe) or later**. Older releases are not supported.
 from a terminal:
 
 ```bash
-git clone https://github.com/<your-username>/retinafy.git
+git clone https://github.com/itsdezen/retinafy.git
 cd retinafy
 ./retinafy.sh
 ```
@@ -20,7 +20,7 @@ cd retinafy
 **Remote** — run directly without cloning:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<your-username>/retinafy/main/retinafy.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/itsdezen/retinafy/main/retinafy.sh)"
 ```
 
 (Icon customization needs the `icons/` folder next to the script, so the
