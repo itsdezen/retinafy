@@ -702,6 +702,13 @@ disable_flow() {
     prompt "Choice [1-${i}, a]: "
     read -r choice
 
+    if [[ "$choice" == "a" ]]; then
+        log_warn "This deletes ${OVERRIDES_DIR} entirely, including anything there that wasn't installed by retinafy."
+        prompt "Remove ALL overrides? [Y/n] (default: Yes): "
+        read -r confirm_all
+        [[ -z "$confirm_all" || "$confirm_all" =~ ^[Yy]$ ]] || die "Aborted."
+    fi
+
     start_sudo_keepalive
 
     if [[ "$choice" == "a" ]]; then
