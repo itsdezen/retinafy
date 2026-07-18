@@ -20,6 +20,7 @@ PLISTBUDDY="/usr/libexec/PlistBuddy"
 
 WORKDIR=""
 SUDO_KEEPALIVE_PID=""
+DRY_RUN=""
 
 # ---------------------------------------------------------------------------
 # Presentation
@@ -33,8 +34,12 @@ if [[ -t 1 ]]; then
     C_GREEN=$'\033[32m'
     C_YELLOW=$'\033[33m'
     C_RED=$'\033[31m'
+    C_PURPLE=$'\033[35m'
+    C_BLUE=$'\033[34m'
+    TTY=1
 else
-    C_RESET=""; C_BOLD=""; C_DIM=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_PURPLE=""; C_BLUE=""
+    TTY=""
 fi
 
 print_banner() {
@@ -49,13 +54,47 @@ log_info() { printf "%s\n" "${C_DIM}  $*${C_RESET}"; }
 log_ok()   { printf "%s\n" "${C_GREEN}  ✓ $*${C_RESET}"; }
 log_warn() { printf "%s\n" "${C_YELLOW}  ! $*${C_RESET}"; }
 log_err()  { printf "%s\n" "${C_RED}  ✗ $*${C_RESET}" >&2; }
-section()  { printf "\n%s\n\n" "${C_BOLD}$*${C_RESET}"; }
+section()  { printf "\n%s\n\n" "${C_PURPLE}${C_BOLD}➤ $*${C_RESET}"; }
 prompt()   { printf "%s" "${C_YELLOW}› $*${C_RESET}"; }
 
 die() {
+    spin_stop
     log_err "$*"
     exit 1
 }
+
+# ---------------------------------------------------------------------------
+# Spinner — used around slow, non-interactive steps (display scans, sudo
+# install/remove). Falls back to a plain log_info line on non-tty output.
+# ---------------------------------------------------------------------------
+
+SPIN_PID=""
+
+spin() {
+    if [[ -z "$TTY" ]]; then
+        log_info "$1"
+        return
+    fi
+    local msg="$1" i=0 frames='|/-\'
+    ( while true; do
+        printf "\r%s" "${C_BLUE}  ${frames:$i:1}${C_RESET} ${msg}"
+        i=$(( (i + 1) % 4 ))
+        sleep 0.1
+    done ) &
+    SPIN_PID=$!
+    disown "$SPIN_PID" 2>/dev/null
+}
+
+spin_stop() {
+    [[ -z "$SPIN_PID" ]] && return
+    kill "$SPIN_PID" 2>/dev/null
+    wait "$SPIN_PID" 2>/dev/null
+    SPIN_PID=""
+    printf "\r\033[2K"
+}
+
+spin_ok()   { spin_stop; log_ok "$*"; }
+spin_warn() { spin_stop; log_warn "$*"; }
 
 # ---------------------------------------------------------------------------
 # Environment checks
@@ -75,6 +114,10 @@ is_apple_silicon() {
 }
 
 start_sudo_keepalive() {
+    if [[ -n "$DRY_RUN" ]]; then
+        log_info "[dry-run] skipping sudo authentication."
+        return
+    fi
     sudo -v || die "Administrator privileges are required to continue."
     ( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
     SUDO_KEEPALIVE_PID=$!
@@ -82,6 +125,7 @@ start_sudo_keepalive() {
 }
 
 cleanup() {
+    spin_stop
     if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
         wait "$SUDO_KEEPALIVE_PID" 2>/dev/null
@@ -214,6 +258,7 @@ load_system_profiler_snapshot() {
 }
 
 discover_displays() {
+    spin "Scanning connected displays..."
     load_system_profiler_snapshot
 
     if is_apple_silicon; then
@@ -239,6 +284,7 @@ discover_displays() {
     DISP_PID=("${kept_pid[@]}")
     DISP_NAME=("${kept_name[@]}")
     DISP_EDID=("${kept_edid[@]}")
+    spin_ok "Found ${#DISP_VID[@]} external display(s)."
 }
 
 select_display() {
@@ -496,6 +542,16 @@ merge_icons_plist() {
 # ---------------------------------------------------------------------------
 
 install_override() {
+    if [[ -n "$DRY_RUN" ]]; then
+        log_info "[dry-run] would install ${OVERRIDES_DIR}/DisplayVendorID-${VID}/DisplayProductID-${PID}"
+        [[ -n "${MERGED_ICONS_PLIST:-}" ]] && log_info "[dry-run] would merge ${OVERRIDES_DIR}/Icons.plist"
+        log_info "[dry-run] would set DisplayResolutionEnabled in com.apple.windowserver"
+        log_ok "[dry-run] HiDPI would be enabled for ${NAME}. No changes were made."
+        return
+    fi
+
+    spin "Installing override for ${NAME}..."
+
     sudo mkdir -p "${OVERRIDES_DIR}/DisplayVendorID-${VID}"
 
     if [[ -n "${DEVICE_ICON_SRC:-}" ]]; then
@@ -515,12 +571,16 @@ install_override() {
 
     sudo defaults write /Library/Preferences/com.apple.windowserver DisplayResolutionEnabled -bool YES
 
-    log_ok "HiDPI enabled for ${NAME}. Reboot to apply."
+    spin_ok "HiDPI enabled for ${NAME}. Reboot to apply."
     log_info "The boot logo will look oversized on the very first reboot only."
 }
 
 remove_override() {
     local vid_hex=$1
+    if [[ -n "$DRY_RUN" ]]; then
+        log_info "[dry-run] would remove ${OVERRIDES_DIR}/DisplayVendorID-${vid_hex}"
+        return
+    fi
     if [[ -f "${OVERRIDES_DIR}/Icons.plist" ]]; then
         sudo "$PLISTBUDDY" -c "Delete :vendors:${vid_hex}" "${OVERRIDES_DIR}/Icons.plist" >/dev/null 2>&1
     fi
@@ -645,7 +705,13 @@ disable_flow() {
     start_sudo_keepalive
 
     if [[ "$choice" == "a" ]]; then
-        sudo rm -rf "$OVERRIDES_DIR"
+        if [[ -n "$DRY_RUN" ]]; then
+            log_info "[dry-run] would remove ${OVERRIDES_DIR}"
+        else
+            spin "Removing all overrides..."
+            sudo rm -rf "$OVERRIDES_DIR"
+            spin_stop
+        fi
         log_ok "All overrides removed. Reboot to apply."
         return
     fi
@@ -653,7 +719,9 @@ disable_flow() {
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= i )); then
         local target="${dirs[$choice]}"
         local vid_hex="${target##*DisplayVendorID-}"
+        [[ -z "$DRY_RUN" ]] && spin "Removing $(basename "$target")..."
         remove_override "$vid_hex"
+        [[ -z "$DRY_RUN" ]] && spin_stop
         log_ok "Removed $(basename "$target"). Reboot to apply."
     else
         die "Invalid choice."
@@ -677,40 +745,34 @@ enable_flow() {
     else
         log_warn "Could not auto-detect the native resolution via system_profiler."
     fi
-    echo "  1) Auto   — generate the same variant ladder macOS uses for real Retina displays"
-    echo "  2) Manual — type your own list of \"looks like\" resolutions"
-    printf "\n"
-    prompt "Choice [1-2]: "
-    read -r res_choice
 
     local native_w="" native_h=""
+    local res_choice=""
     if [[ -n "$native" ]]; then
         native_w="${native%x*}"
         native_h="${native#*x}"
+        compute_auto_ladder "$native_w" "$native_h"
+
+        echo "  1) Auto   — generate the same variant ladder macOS uses for real Retina displays"
+        local i
+        for ((i = 0; i < ${#RESOLUTIONS[@]}; i++)); do
+            printf "       %-12s %s\n" "${RESOLUTION_LABELS[$i]}" "${RESOLUTIONS[$i]}"
+        done
+        echo "  2) Manual — type your own list of \"looks like\" resolutions"
+        printf "\n"
+        prompt "Choice [1-2]: "
+        read -r res_choice
+    else
+        log_warn "Auto mode unavailable without a detected native resolution — falling back to manual."
+        res_choice=2
     fi
 
     case "$res_choice" in
     1)
-        if [[ -z "$native_w" ]]; then
-            prompt "Enter the display's native resolution, e.g. 1920x1080: "
-            read -r manual_native
-            native_w="${manual_native%x*}"
-            native_h="${manual_native#*x}"
-        fi
-        [[ "$native_w" =~ ^[0-9]+$ && "$native_h" =~ ^[0-9]+$ ]] || die "Invalid resolution."
-        compute_auto_ladder "$native_w" "$native_h"
-        local i
-        for ((i = 0; i < ${#RESOLUTIONS[@]}; i++)); do
-            log_info "$(printf '%-12s %s' "${RESOLUTION_LABELS[$i]}" "${RESOLUTIONS[$i]}")"
-        done
         log_ok "${#RESOLUTIONS[@]} HiDPI variants generated from ${native_w}x${native_h}. Default (${DEFAULT_RESOLUTION}) will be applied."
         ;;
     2)
-        local prefill=""
-        if [[ -n "$native_w" ]]; then
-            compute_auto_ladder "$native_w" "$native_h"
-            prefill="${RESOLUTIONS[*]}"
-        fi
+        local prefill="${RESOLUTIONS[*]}"
         local list_prompt="Edit the \"looks like\" resolutions, space-separated"
         [[ -n "$prefill" ]] && list_prompt="${list_prompt} [${prefill}]"
         prompt "${list_prompt}: "
@@ -735,7 +797,7 @@ enable_flow() {
     esac
 
     PATCHED_EDID=""
-    if [[ -n "$EDID" ]]; then
+    if ! is_apple_silicon && [[ -n "$EDID" ]]; then
         printf "\n"
         prompt "Apply the EDID sleep/wake compatibility patch? Only needed if the display drops to a lower resolution after sleep. [y/N] (default: No): "
         read -r patch_choice
@@ -751,6 +813,11 @@ enable_flow() {
     merge_icons_plist
     install_override
 
+    if [[ -n "$DRY_RUN" ]]; then
+        log_info "[dry-run] skipping confirm-or-revert window and uninstall helper."
+        return
+    fi
+
     if confirm_or_revert; then
         write_uninstall_helper
     fi
@@ -761,8 +828,17 @@ enable_flow() {
 # ---------------------------------------------------------------------------
 
 main() {
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == "--dry-run" ]] && DRY_RUN=1
+    done
+
     require_macos26
     print_banner
+
+    if [[ -n "$DRY_RUN" ]]; then
+        log_warn "DRY RUN — no sudo commands will run, no files will be written to the system."
+    fi
 
     echo "  1) Enable HiDPI"
     echo "  2) Disable HiDPI"
