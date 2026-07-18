@@ -1,5 +1,7 @@
 # retinafy
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/itsdezen)
+
 Simulate HiDPI ("Retina") scaling on external displays that don't natively
 report a HiDPI mode to macOS — with a "Looks like" resolution picker in
 System Settings ▸ Displays, just like a real Retina panel.
